@@ -4,6 +4,8 @@
 
 #include <boost/filesystem.hpp>
 #include <boost/program_options.hpp>
+#include <boost/property_tree/ptree.hpp>
+#include <boost/property_tree/json_parser.hpp>
 
 #include <nil/crypto3/algebra/curves/bls12.hpp>
 #include <nil/crypto3/algebra/fields/bls12/base_field.hpp>
@@ -41,6 +43,168 @@ typedef zk::snark::r1cs_gg_ppzksnark<curve_type> scheme_type;
 
 typedef verifier_input_serializer_tvm<scheme_type> serializer_tvm;
 typedef verifier_input_deserializer_tvm<scheme_type> deserializer_tvm;
+
+std::vector<bool> knapsack_hash(const std::vector<bool>& bv);
+std::vector<bool> string_to_binary(const std::string& s);
+std::vector<bool> number_to_binary(const multiprecision::uint256_t& preimage);
+std::vector<uint8_t> read_vector_from_disk(boost::filesystem::path file_path);
+void write_vector_to_disk(boost::filesystem::path file_path, const std::vector<uint8_t> &data);
+void write_primary_input(boost::filesystem::path file_path, const std::vector<bool> &data);
+std::vector<bool> read_primary_input(boost::filesystem::path file_path);
+scheme_type::proving_key_type get_pkey(boost::filesystem::path pkin);
+scheme_type::verification_key_type get_vkey( boost::filesystem::path vkin);
+
+int main(int argc, char *argv[]) {
+
+    boost::program_options::options_description options(
+        "Knapsack-hash preimage knowledge proof generator / verifier");
+        options.add_options()
+        ("hash", "Generate public input (hash) from your secret (preimage)")
+        ("keys", "Generate proof key and verifier key")
+        ("proof", "Generate proof")
+        ("verify", "Verify proof");
+
+    boost::program_options::variables_map vm;
+    boost::program_options::store(boost::program_options::command_line_parser(argc, argv).options(options).run(), vm);
+    boost::program_options::notify(vm);
+
+    if (argc < 2) {
+        std::cout << options << std::endl;
+        return 0;
+    }
+
+    assert(argc == 2);
+
+    // Primary input file generator (Knapsack hash)
+    if (vm.count("hash")) {
+        multiprecision::uint256_t preimage;
+
+        std::cout << "Enter secret number: ";
+        std::cin >> preimage;
+
+        std::vector<bool> preimage_bv = number_to_binary(preimage);
+        std::vector<bool> h_bv = knapsack_hash(preimage_bv); 
+
+        boost::filesystem::path hout = "./primary_input.json";
+
+        write_primary_input(hout, h_bv);
+        std::cout << "Hash of secret was written to \"./primary_input.json\" file" << std::endl;
+
+        return 0;
+    }
+
+    // Create blueprint and constraints
+    blueprint<field_type> bp;
+    
+    digest_variable<field_type> out(bp, KNAPSACK_HASH_SIZE);
+    block_variable<field_type> x(bp, PREIMAGE_SIZE);
+
+    bp.set_input_sizes(255);
+
+    knapsack_crh_with_bit_out_component<field_type> f(bp, PREIMAGE_SIZE, x, out);
+
+    f.generate_r1cs_constraints();
+
+    // Generate keys
+    if (vm.count("keys")) {
+        boost::filesystem::path pkout = "./pk", vkout = "./vk";
+        const snark::r1cs_constraint_system<field_type> constraint_system = bp.get_constraint_system();
+        const typename scheme_type::keypair_type keypair = snark::generate<scheme_type>(constraint_system);
+
+        std::cout << "Keys generated (pkey - \"./pkey\", vkey - \"./vkey\")" << std::endl;
+
+        std::vector<std::uint8_t> verification_key_byteblob =
+            serializer_tvm::process(keypair.second);
+        write_vector_to_disk(vkout, verification_key_byteblob);
+        
+        std::vector<std::uint8_t> proving_key_byteblob =
+            serializer_tvm::process(keypair.first);
+        write_vector_to_disk(pkout, proving_key_byteblob);
+
+        return 0;
+    }
+
+    // Proof generator
+    if (vm.count("proof")) {
+        multiprecision::uint256_t preimage;
+
+        std::cout << "Enter secret (preimage of hash): ";
+        std::cin >> preimage;
+        
+        std::vector<bool> preimage_bv = number_to_binary(preimage);
+
+        boost::filesystem::path hash = "./primary_input.json";
+        std::vector<bool> hash_bv = read_primary_input(hash);
+
+        // Generating witness
+        x.generate_r1cs_witness(preimage_bv);
+        f.generate_r1cs_witness();
+        out.generate_r1cs_witness(hash_bv);
+
+        assert(bp.is_satisfied());
+        std::cout << "Witness was generated" << std::endl;
+
+        boost::filesystem::path pkin = "./pk";
+        scheme_type::proving_key_type pkey = get_pkey(pkin);
+
+        std::cout << "Prooving key was read from \"./pkey\"" << std::endl;
+
+        std::cout << "Start generating the proof" << std::endl;
+        const typename scheme_type::proof_type proof = snark::prove<scheme_type>(pkey, bp.primary_input(), bp.auxiliary_input());
+
+        boost::filesystem::path proof_path = "./proof";
+        std::vector<std::uint8_t> proof_byteblob =
+            serializer_tvm::process(proof);
+
+        boost::filesystem::ofstream poutf(proof_path);
+        for (const auto &v : proof_byteblob) {
+            poutf << v;
+        }
+        poutf.close();
+
+        std::cout << "Proof was written to \"./proof\" file" << std::endl;
+
+        return 0;
+    }
+
+    // Verify proof
+    if (vm.count("verify")) {
+        boost::filesystem::path hash = "./primary_input.json";
+        std::vector<bool> hash_bv = read_primary_input(hash);
+        std::cout << "Primary input was read from \"./primary_input.json\" file" << std::endl;
+
+        // Filling primary_input (bp.primary_input())
+        out.generate_r1cs_witness(hash_bv);
+        boost::filesystem::path vkin = "./vk";
+        scheme_type::verification_key_type vkey = get_vkey(vkin);
+        std::cout << "Verification key was read from \"./vkey\" file" << std::endl;
+
+        boost::filesystem::path proof_path = "./proof";
+        std::vector<uint8_t> proof_v = read_vector_from_disk(proof_path);
+
+        nil::marshalling::status_type proof_deserialize_status;
+        scheme_type::proof_type proof = deserializer_tvm::proof_process(
+            proof_v.begin(), proof_v.end(), proof_deserialize_status
+        );
+
+        if (proof_deserialize_status != nil::marshalling::status_type::success) {
+            std::cerr << "Error: Could not deserialize verifying key" << std::endl;
+            std::cerr << "Status is:" << static_cast<int>(proof_deserialize_status) << std::endl;
+            exit(-1);
+        }
+        std::cout << "Proof was read from \"./proof\" file" << std::endl;
+
+        bool verified = snark::verify<scheme_type>(vkey, bp.primary_input(), proof);
+        std::cout << std::endl << "Verification status: " << verified << std::endl;
+
+        return 0;
+    }
+    
+    return 0;
+}
+
+// ----------------------------------------------------------------------------------
+// ------------------------------MOVE TO UTILS.CPP-----------------------------------
 
 std::vector<bool> knapsack_hash(const std::vector<bool>& bv) {
     return components::knapsack_crh_with_bit_out_component<field_type>::get_hash(bv);
@@ -90,17 +254,27 @@ void write_vector_to_disk(boost::filesystem::path file_path, const std::vector<u
 }
 
 void write_primary_input(boost::filesystem::path file_path, const std::vector<bool> &data) {
-    boost::filesystem::ofstream ostream(file_path);
+    std::stringstream ss;
     for (int bit: data) {
-        ostream << bit;
+        ss << bit;
     }
+
+    boost::property_tree::ptree root;
+    root.put("hash", ss.str());
+
+    boost::filesystem::ofstream ostream(file_path);
+    boost::property_tree::write_json(ostream, root);
     ostream.close();
 }
 
 std::vector<bool> read_primary_input(boost::filesystem::path file_path) {
     boost::filesystem::ifstream instream(file_path);
-    std::string bin_hash((std::istreambuf_iterator<char>(instream)), std::istreambuf_iterator<char>());
+
+    boost::property_tree::ptree root;
+    boost::property_tree::read_json(instream, root);
     instream.close();
+
+    std::string bin_hash(root.get<std::string>("hash"));
 
     std::vector<bool> result = string_to_binary(bin_hash);
     return result;
@@ -140,150 +314,4 @@ scheme_type::verification_key_type get_vkey( boost::filesystem::path vkin) {
     }
 
     return verification_key;
-}
-
-int main(int argc, char *argv[]) {
-
-    boost::program_options::options_description options(
-        "Knapsack-hash preimage knowledge proof generator / verifier");
-        options.add_options()
-        ("hash", "Generate public input (hash) from your secret (preimage)")
-        ("keys", "Generate proof key and verifier key")
-        ("proof", "Generate proof")
-        ("verify", "Verify proof");
-
-    boost::program_options::variables_map vm;
-    boost::program_options::store(boost::program_options::command_line_parser(argc, argv).options(options).run(), vm);
-    boost::program_options::notify(vm);
-
-    if (argc < 2) {
-        std::cout << options << std::endl;
-        return 0;
-    }
-
-    assert(argc == 2);
-
-    if (vm.count("hash")) {
-        multiprecision::uint256_t preimage;
-
-        std::cout << "Enter secret number: ";
-        std::cin >> preimage;
-
-        std::vector<bool> preimage_bv = number_to_binary(preimage);
-        std::vector<bool> h_bv = knapsack_hash(preimage_bv); 
-
-        boost::filesystem::path hout = "./primary_input";
-
-        write_primary_input(hout, h_bv);
-        std::cout << "Hash of secret was written to \"./primary_input\" file" << std::endl;
-
-        return 0;
-    }
-
-    // Create blueprint and constraints
-    blueprint<field_type> bp;
-    
-    digest_variable<field_type> out(bp, KNAPSACK_HASH_SIZE);
-    block_variable<field_type> x(bp, PREIMAGE_SIZE);
-
-    bp.set_input_sizes(255);
-
-    knapsack_crh_with_bit_out_component<field_type> f(bp, PREIMAGE_SIZE, x, out);
-
-    f.generate_r1cs_constraints();
-
-    // Generate Pk and Vk
-    if (vm.count("keys")) {
-        boost::filesystem::path pkout = "./pk", vkout = "./vk";
-        const snark::r1cs_constraint_system<field_type> constraint_system = bp.get_constraint_system();
-        const typename scheme_type::keypair_type keypair = snark::generate<scheme_type>(constraint_system);
-
-        std::cout << "Keys generated (pkey - \"./pkey\", vkey - \"./vkey\")" << std::endl;
-
-        std::vector<std::uint8_t> verification_key_byteblob =
-            serializer_tvm::process(keypair.second);
-        write_vector_to_disk(vkout, verification_key_byteblob);
-        
-        std::vector<std::uint8_t> proving_key_byteblob =
-            serializer_tvm::process(keypair.first);
-        write_vector_to_disk(pkout, proving_key_byteblob);
-
-        return 0;
-    }
-
-    // Proof
-    if (vm.count("proof")) {
-        multiprecision::uint256_t preimage;
-
-        std::cout << "Enter secret (preimage of hash): ";
-        std::cin >> preimage;
-        
-        std::vector<bool> preimage_bv = number_to_binary(preimage);
-
-        boost::filesystem::path hash = "./primary_input";
-        std::vector<bool> hash_bv = read_primary_input(hash);
-
-        x.generate_r1cs_witness(preimage_bv);
-        f.generate_r1cs_witness();
-        out.generate_r1cs_witness(hash_bv);
-
-        assert(bp.is_satisfied());
-        std::cout << "Witness was generated" << std::endl;
-
-        boost::filesystem::path pkin = "./pk";
-        scheme_type::proving_key_type pkey = get_pkey(pkin);
-
-        std::cout << "Prooving key was read from \"./pkey\"" << std::endl;
-
-        std::cout << "Start generating the proof" << std::endl;
-        const typename scheme_type::proof_type proof = snark::prove<scheme_type>(pkey, bp.primary_input(), bp.auxiliary_input());
-
-        boost::filesystem::path proof_path = "./proof";
-        std::vector<std::uint8_t> proof_byteblob =
-            serializer_tvm::process(proof);
-
-        boost::filesystem::ofstream poutf(proof_path);
-        for (const auto &v : proof_byteblob) {
-            poutf << v;
-        }
-        poutf.close();
-
-        std::cout << "Proof was written to \"./proof\" file" << std::endl;
-
-        return 0;
-    }
-
-    // Verify
-    if (vm.count("verify")) {
-        boost::filesystem::path hash = "./primary_input";
-        std::vector<bool> hash_bv = read_primary_input(hash);
-        std::cout << "Primary input was read from \"./primary_input\" file" << std::endl;
-
-        out.generate_r1cs_witness(hash_bv);
-        boost::filesystem::path vkin = "./vk";
-        scheme_type::verification_key_type vkey = get_vkey(vkin);
-        std::cout << "Verification key was read from \"./vkey\" file" << std::endl;
-
-        boost::filesystem::path proof_path = "./proof";
-        std::vector<uint8_t> proof_v = read_vector_from_disk(proof_path);
-
-        nil::marshalling::status_type proof_deserialize_status;
-        scheme_type::proof_type proof = deserializer_tvm::proof_process(
-            proof_v.begin(), proof_v.end(), proof_deserialize_status
-        );
-
-        if (proof_deserialize_status != nil::marshalling::status_type::success) {
-            std::cerr << "Error: Could not deserialize verifying key" << std::endl;
-            std::cerr << "Status is:" << static_cast<int>(proof_deserialize_status) << std::endl;
-            exit(-1);
-        }
-        std::cout << "Proof was read from \"./proof\" file" << std::endl;
-
-        bool verified = snark::verify<scheme_type>(vkey, bp.primary_input(), proof);
-        std::cout << std::endl << "Verification status: " << verified << std::endl;
-
-        return 0;
-    }
-    
-    return 0;
 }
