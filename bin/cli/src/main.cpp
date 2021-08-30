@@ -7,9 +7,6 @@
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/algorithm/hex.hpp>
-#include <boost/random.hpp>
-#include <boost/generator_iterator.hpp>
-#include <boost/random/variate_generator.hpp>
 
 #include <nil/crypto3/algebra/curves/bls12.hpp>
 #include <nil/crypto3/algebra/fields/bls12/base_field.hpp>
@@ -34,6 +31,7 @@
 #include <nil/crypto3/zk/snark/schemes/ppzksnark/r1cs_gg_ppzksnark/marshalling.hpp>
 
 #define PREIMAGE_SIZE 256
+#define HASHING_LIST_SIZE 4
 
 using namespace nil::crypto3;
 using namespace nil::crypto3::zk;
@@ -50,13 +48,15 @@ typedef verifier_input_deserializer_tvm<scheme_type> deserializer_tvm;
 constexpr const std::size_t modulus_bits = field_type::modulus_bits;
 constexpr const std::size_t modulus_chunks = modulus_bits / 8 + (modulus_bits % 8 ? 1 : 0);
 
+std::string field_element_to_hex(field_type::value_type element);
+field_type::value_type hex_to_field_element(const std::string& hex);
 std::string knapsack_hash(const std::vector<bool>& bv);
 std::vector<bool> string_to_binary(const std::string& s);
 std::vector<bool> number_to_binary(const multiprecision::uint256_t& preimage);
 std::vector<uint8_t> read_vector_from_disk(boost::filesystem::path file_path);
 void write_vector_to_disk(boost::filesystem::path file_path, const std::vector<uint8_t> &data);
-void write_primary_input(boost::filesystem::path file_path, const std::string& hash_hex);
-field_type::value_type read_primary_input(boost::filesystem::path file_path);
+void write_primary_input(boost::filesystem::path file_path, const std::vector<std::string>& hashes);
+std::vector<field_type::value_type> read_primary_input(boost::filesystem::path file_path);
 scheme_type::proving_key_type get_pkey(boost::filesystem::path pkin);
 scheme_type::verification_key_type get_vkey( boost::filesystem::path vkin);
 
@@ -82,20 +82,32 @@ int main(int argc, char *argv[]) {
     assert(argc == 2);
 
     // Primary input file generator (Knapsack hash)
-    // Also generates 3 more random hashes, needed for demonstration
+    // Also generates 3 more random hashes, needed for demonstration of PoM
     if (vm.count("hash")) {
         multiprecision::uint256_t preimage;
+        uint seed;
 
         std::cout << "Enter secret number: ";
         std::cin >> preimage;
 
-        std::vector<bool> preimage_bv = number_to_binary(preimage);
-        std::string hash_hex = knapsack_hash(preimage_bv); 
+        boost::random::mt19937 rng(std::time(0));
+        boost::random::uniform_int_distribution<> my_rand(10000000, 99999999);
+
+        multiprecision::uint256_t rand1 = my_rand(rng);
+        multiprecision::uint256_t rand2 = my_rand(rng);
+        multiprecision::uint256_t rand3 = my_rand(rng);
+
+        std::string hash1 = knapsack_hash(number_to_binary(rand1));
+        std::string hash2 = knapsack_hash(number_to_binary(rand2));
+        std::string hash3 = knapsack_hash(number_to_binary(rand3));
+        std::string secret_hash = knapsack_hash(number_to_binary(preimage)); 
 
         boost::filesystem::path hout = "./primary_input.json";
 
-        write_primary_input(hout, hash_hex);
+        write_primary_input(hout, {secret_hash, hash1, hash2, hash3});
         std::cout << "Hash of secret was written to \"./primary_input.json\" file" << std::endl;
+
+        read_primary_input(hout);
 
         return 0;
     }
@@ -103,15 +115,29 @@ int main(int argc, char *argv[]) {
     // Create blueprint and constraints
     blueprint<field_type> bp;
     
-    blueprint_variable<field_type> out;
-    out.allocate(bp);
+    blueprint_variable_vector<field_type> hash_list;
+    hash_list.allocate(bp, HASHING_LIST_SIZE);
+
+    blueprint_variable_vector<field_type> bool_mask;
+    bool_mask.allocate(bp, HASHING_LIST_SIZE);
+
+    blueprint_variable<field_type> secret_hash;
+    secret_hash.allocate(bp);
 
     block_variable<field_type> secret(bp, PREIMAGE_SIZE);
 
-    bp.set_input_sizes(1);
+    bp.set_input_sizes(4);
 
-    knapsack_crh_with_field_out_component<field_type> f(bp, PREIMAGE_SIZE, secret, blueprint_variable_vector<field_type>(1, out));
+    for (auto field_var: bool_mask) {
+        generate_boolean_r1cs_constraint<field_type>(bp, field_var);
+    }
 
+    for (int i = 0; i < HASHING_LIST_SIZE; i++) {
+        bp.add_r1cs_constraint(r1cs_constraint<field_type>(bool_mask[i], hash_list[i] - secret_hash, 0));
+    }
+
+    knapsack_crh_with_field_out_component<field_type> 
+                f(bp, PREIMAGE_SIZE, secret, blueprint_variable_vector<field_type>(1, secret_hash));
     f.generate_r1cs_constraints();
 
     // Generate keys
@@ -141,17 +167,32 @@ int main(int argc, char *argv[]) {
         std::cin >> preimage;
         
         std::vector<bool> preimage_bv = number_to_binary(preimage);
+        field_type::value_type secret_hash_w = hex_to_field_element(knapsack_hash(preimage_bv));
 
         boost::filesystem::path path = "./primary_input.json";
-        field_type::value_type hash = read_primary_input(path);
+        std::vector<field_type::value_type> hashes = read_primary_input(path);
 
         // Generating witness
+
+        // Filling primary_input
+        for (int i = 0; i < HASHING_LIST_SIZE; i++) {
+            bp.val(hash_list[i]) = hashes[i];
+        }
+        
+        // Filling auxilary input
         secret.generate_r1cs_witness(preimage_bv);
         f.generate_r1cs_witness();
-        bp.val(out) = hash;
+        bp.val(secret_hash) = secret_hash_w;
+
+        for (int i = 0; i < HASHING_LIST_SIZE; i++) {
+            if (hashes[i] == secret_hash_w) {
+                bp.val(bool_mask[i]) = field_type::value_type::one();
+                continue;
+            }
+            bp.val(bool_mask[i]) = field_type::value_type::zero();
+        }
 
         assert(bp.is_satisfied());
-        std::cout << "Witness was generated" << std::endl;
 
         boost::filesystem::path pkin = "./pk";
         scheme_type::proving_key_type pkey = get_pkey(pkin);
@@ -168,7 +209,7 @@ int main(int argc, char *argv[]) {
         boost::filesystem::ofstream poutf(proof_path);
         for (const auto &v : proof_byteblob) {
             poutf << v;
-        }
+        } 
         poutf.close();
 
         std::cout << "Proof was written to \"./proof\" file" << std::endl;
@@ -179,11 +220,13 @@ int main(int argc, char *argv[]) {
     // Verify proof
     if (vm.count("verify")) {
         boost::filesystem::path path = "./primary_input.json";
-        field_type::value_type hash = read_primary_input(path);
+        std::vector<field_type::value_type> hashes = read_primary_input(path);
         std::cout << "Primary input was read from \"./primary_input.json\" file" << std::endl;
 
-        // Filling primary_input (bp.primary_input())
-        bp.val(out) = hash;
+        // Filling primary_input
+        for (int i = 0; i < HASHING_LIST_SIZE; i++) {
+            bp.val(hash_list[i]) = hashes[i];
+        }
         boost::filesystem::path vkin = "./vk";
         scheme_type::verification_key_type vkey = get_vkey(vkin);
         std::cout << "Verification key was read from \"./vkey\" file" << std::endl;
@@ -224,6 +267,17 @@ std::string field_element_to_hex(field_type::value_type element) {
     return hex;
 }
 
+field_type::value_type hex_to_field_element(const std::string& hex) {
+    std::vector<uint8_t> hash_bytes(modulus_chunks);
+    boost::algorithm::unhex(hex.begin(), hex.end(), hash_bytes.begin());
+
+    status_type status;
+    field_type::value_type result = 
+        deserializer_tvm::field_type_process<field_type>(hash_bytes.begin(), hash_bytes.end(), status);
+
+    return result;
+}
+
 std::string knapsack_hash(const std::vector<bool>& bv) {
     field_type::value_type h = knapsack_crh_with_field_out_component<field_type>::get_hash(bv)[0];
 
@@ -255,43 +309,35 @@ void write_vector_to_disk(boost::filesystem::path file_path, const std::vector<u
     ostream.close();
 }
 
-void write_primary_input(boost::filesystem::path file_path, const std::string& hash_hex) {
+void write_primary_input(boost::filesystem::path file_path, const std::vector<std::string>& hashes) {
     boost::property_tree::ptree root;
-    root.put("hash1", hash_hex);
-
-    // boost::random::mt19937 rng;
-    // boost::random::uniform_int_distribution<> my_rand(10000000, 99999999);
-
-    // multiprecision::uint256_t rand1 = my_rand(rng);
-    // multiprecision::uint256_t rand2 = my_rand(rng);
-    // multiprecision::uint256_t rand3 = my_rand(rng);
-
-    // std::cout << rand1 << std::endl;
-    // std::cout << rand2 << std::endl;
-    // std::cout << rand3 << std::endl;
-
-    // std::string random_hash1 = number_to_binary(my_rand(rng));
+    root.put("hash1", hashes[0]);
+    root.put("hash2", hashes[1]);
+    root.put("hash3", hashes[2]);
+    root.put("hash4", hashes[3]);
 
     boost::filesystem::ofstream ostream(file_path);
     boost::property_tree::write_json(ostream, root);
     ostream.close();
 }
 
-field_type::value_type read_primary_input(boost::filesystem::path file_path) {
+std::vector<field_type::value_type> read_primary_input(boost::filesystem::path file_path) {
     boost::filesystem::ifstream instream(file_path);
 
     boost::property_tree::ptree root;
     boost::property_tree::read_json(instream, root);
     instream.close();
 
-    std::string hash_hex(root.get<std::string>("hash1"));
+    std::vector<std::string> stringHashes;
 
-    std::vector<uint8_t> hash_bytes(modulus_chunks);
-    boost::algorithm::unhex(hash_hex.begin(), hash_hex.end(), hash_bytes.begin());
+    for (auto node: root) {
+        stringHashes.push_back(node.second.data());
+    }
 
-    status_type d_status;
-    field_type::value_type result = 
-            deserializer_tvm::field_type_process<field_type>(hash_bytes.begin(), hash_bytes.end(), d_status);
+    std::vector<field_type::value_type> result(stringHashes.size());
+    for (int i = 0; i < result.size(); i++) {
+        result[i] = hex_to_field_element(stringHashes[i]);
+    }
     
     return result;
 }
