@@ -153,7 +153,7 @@ int main(int argc, char *argv[]) {
     // Preimage (auxilary input)
     block_variable<field_type> secret(bp, PREIMAGE_SIZE);
 
-    bp.set_input_sizes(4);
+    bp.set_input_sizes(HASHING_LIST_SIZE);
 
     // Generating constraints for bool mask
     for (auto field_var: bool_mask) {
@@ -415,7 +415,7 @@ scheme_type::verification_key_type get_vkey(boost::filesystem::path vkin) {
 }
 
 // ----------------------------------------------------------------------------------
-// -----------------------------UTILS-TESTS------------------------------------------
+// ------------------------------------TESTS-----------------------------------------
 
 TEST(serializing_deserializing, number_to_bit_vector) {
     multiprecision::uint256_t number = 1000;
@@ -441,4 +441,102 @@ TEST(serializing_deserializing, string_fieldVariable) {
     std::string hash_hex = knapsack_hash(number_to_binary(1000));
     field_type::value_type hash_field = hex_to_field_element(hash_hex);
     EXPECT_TRUE(field_element_to_hex(hash_field) == hash_hex);
+}
+
+// Testing snark - knowledge the preimage of knapsack hash (first constraint in project)
+TEST(snark_tests, knapsack_component) {
+    blueprint<field_type> bp;
+
+    blueprint_variable<field_type> out;
+    out.allocate(bp);
+
+    block_variable<field_type> secret(bp, PREIMAGE_SIZE);
+
+    bp.set_input_sizes(1);
+
+    knapsack_crh_with_field_out_component<field_type> 
+                    f(bp, PREIMAGE_SIZE, secret, blueprint_variable_vector<field_type>(1, out));
+                    
+    f.generate_r1cs_constraints();
+
+    std::vector<bool> secret_bv = number_to_binary(1000);
+
+    secret.generate_r1cs_witness(secret_bv);
+
+    secret_bv[0] = !secret_bv[0];
+    f.generate_r1cs_witness();
+    bp.val(out) = hex_to_field_element(knapsack_hash(secret_bv));
+    EXPECT_FALSE(bp.is_satisfied());   
+    
+    secret_bv[0] = !secret_bv[0]; 
+    f.generate_r1cs_witness();
+    bp.val(out) = hex_to_field_element(knapsack_hash(secret_bv));
+    EXPECT_TRUE(bp.is_satisfied());
+
+    const snark::r1cs_constraint_system<field_type> constraint_system = bp.get_constraint_system();
+    const typename scheme_type::keypair_type keypair = snark::generate<scheme_type>(constraint_system);
+
+    const typename scheme_type::proof_type proof = snark::prove<scheme_type>(keypair.first, bp.primary_input(), bp.auxiliary_input());
+    EXPECT_TRUE(snark::verify<scheme_type>(keypair.second, bp.primary_input(), proof));
+}
+
+// Testing snark - secret_hash is in hashing_list (Second constraint)
+TEST(snark_tests, list_component) {
+    blueprint<field_type> bp;
+    
+    blueprint_variable_vector<field_type> hash_list;
+    hash_list.allocate(bp, HASHING_LIST_SIZE);
+
+    blueprint_variable_vector<field_type> bool_mask;
+    bool_mask.allocate(bp, HASHING_LIST_SIZE);
+
+    blueprint_variable<field_type> secret_hash;
+    secret_hash.allocate(bp);
+
+    bp.set_input_sizes(HASHING_LIST_SIZE);
+
+    for (auto field_var: bool_mask) {
+        generate_boolean_r1cs_constraint<field_type>(bp, field_var);
+    }
+
+    bp.add_r1cs_constraint(r1cs_constraint<field_type>(1, blueprint_sum<field_type>(bool_mask), 1));
+
+    for (int i = 0; i < HASHING_LIST_SIZE; i++) {
+        bp.add_r1cs_constraint(r1cs_constraint<field_type>(bool_mask[i], hash_list[i] - secret_hash, 0));
+    }
+
+    std::vector<field_type::value_type> hashes(HASHING_LIST_SIZE);
+
+    for (int i = 0; i < HASHING_LIST_SIZE; i++) {
+        hashes[i] = hex_to_field_element(knapsack_hash(number_to_binary(i)));
+        bp.val(hash_list[i]) = hex_to_field_element(knapsack_hash(number_to_binary(i)));
+    }
+
+    field_type::value_type secret_hash_w = hex_to_field_element(knapsack_hash(number_to_binary(5)));
+    bp.val(secret_hash) = secret_hash_w;
+    for (int i = 0; i < HASHING_LIST_SIZE; i++) {
+        if (secret_hash_w == hashes[i]) {
+            bp.val(bool_mask[i]) = field_type::value_type::one();
+            continue;
+        }
+        bp.val(bool_mask[i]) = field_type::value_type::zero();
+    }
+    EXPECT_FALSE(bp.is_satisfied());
+
+    secret_hash_w = hex_to_field_element(knapsack_hash(number_to_binary(0)));
+    bp.val(secret_hash) = secret_hash_w;
+    for (int i = 0; i < HASHING_LIST_SIZE; i++) {
+        if (secret_hash_w == hashes[i]) {
+            bp.val(bool_mask[i]) = field_type::value_type::one();
+            continue;
+        }
+        bp.val(bool_mask[i]) = field_type::value_type::zero();
+    }
+    EXPECT_TRUE(bp.is_satisfied());
+
+    const snark::r1cs_constraint_system<field_type> constraint_system = bp.get_constraint_system();
+    const typename scheme_type::keypair_type keypair = snark::generate<scheme_type>(constraint_system);
+
+    const typename scheme_type::proof_type proof = snark::prove<scheme_type>(keypair.first, bp.primary_input(), bp.auxiliary_input());
+    EXPECT_TRUE(snark::verify<scheme_type>(keypair.second, bp.primary_input(), proof));
 }
