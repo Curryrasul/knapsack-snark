@@ -25,3 +25,5 @@ Run tests:
 ```shell
 ./cli --test
 ```
+
+Generated keys are in keys directory
