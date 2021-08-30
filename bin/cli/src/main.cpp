@@ -132,6 +132,8 @@ int main(int argc, char *argv[]) {
         generate_boolean_r1cs_constraint<field_type>(bp, field_var);
     }
 
+    bp.add_r1cs_constraint(r1cs_constraint<field_type>(1, blueprint_sum<field_type>(bool_mask), 1));
+
     for (int i = 0; i < HASHING_LIST_SIZE; i++) {
         bp.add_r1cs_constraint(r1cs_constraint<field_type>(bool_mask[i], hash_list[i] - secret_hash, 0));
     }
