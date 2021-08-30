@@ -1,6 +1,7 @@
 // By Magamedrasul Ibragimov
 
 #include <iostream>
+#include <gtest/gtest.h>
 
 #include <boost/filesystem.hpp>
 #include <boost/program_options.hpp>
@@ -45,18 +46,34 @@ typedef zk::snark::r1cs_gg_ppzksnark<curve_type> scheme_type;
 typedef verifier_input_serializer_tvm<scheme_type> serializer_tvm;
 typedef verifier_input_deserializer_tvm<scheme_type> deserializer_tvm;
 
+// Knapsack hash size
 constexpr const std::size_t modulus_bits = field_type::modulus_bits;
 constexpr const std::size_t modulus_chunks = modulus_bits / 8 + (modulus_bits % 8 ? 1 : 0);
 
+// Convert field_type::value_type to hex string
 std::string field_element_to_hex(field_type::value_type element);
+
+// Convert hex string to field_type::value_type
 field_type::value_type hex_to_field_element(const std::string& hex);
+
+// Returns hex string = knapsack hash of bit_vector 
 std::string knapsack_hash(const std::vector<bool>& bv);
-std::vector<bool> string_to_binary(const std::string& s);
+
+// Converts uint256_t to bit vector
 std::vector<bool> number_to_binary(const multiprecision::uint256_t& preimage);
+
+// Deserializing vkey and pkey
 std::vector<uint8_t> read_vector_from_disk(boost::filesystem::path file_path);
+
+// Serializing vkey and pkey
 void write_vector_to_disk(boost::filesystem::path file_path, const std::vector<uint8_t> &data);
+
+// Generating primary_input file with 4 hashes
 void write_primary_input(boost::filesystem::path file_path, const std::vector<std::string>& hashes);
+
+// Reading primary input from file
 std::vector<field_type::value_type> read_primary_input(boost::filesystem::path file_path);
+
 scheme_type::proving_key_type get_pkey(boost::filesystem::path pkin);
 scheme_type::verification_key_type get_vkey( boost::filesystem::path vkin);
 
@@ -68,7 +85,8 @@ int main(int argc, char *argv[]) {
         ("hash", "Generate public input (hash) from your secret (preimage)")
         ("keys", "Generate proof key and verifier key")
         ("proof", "Generate proof")
-        ("verify", "Verify proof");
+        ("verify", "Verify proof")
+        ("test", "Run tests");
 
     boost::program_options::variables_map vm;
     boost::program_options::store(boost::program_options::command_line_parser(argc, argv).options(options).run(), vm);
@@ -80,6 +98,11 @@ int main(int argc, char *argv[]) {
     }
 
     assert(argc == 2);
+
+    if (vm.count("test")) {
+        ::testing::InitGoogleTest();
+        return RUN_ALL_TESTS();
+    }
 
     // Primary input file generator (Knapsack hash)
     // Also generates 3 more random hashes, needed for demonstration of PoM
@@ -115,34 +138,41 @@ int main(int argc, char *argv[]) {
     // Create blueprint and constraints
     blueprint<field_type> bp;
     
+    // Hash list - primary input
     blueprint_variable_vector<field_type> hash_list;
     hash_list.allocate(bp, HASHING_LIST_SIZE);
 
+    // Bool mask, needed for building constraint that secret hash is in hash_list (private intermediate var)
     blueprint_variable_vector<field_type> bool_mask;
     bool_mask.allocate(bp, HASHING_LIST_SIZE);
 
+    // Secret hash, for building constraint secret_hash = knapsack(preimage) (private intermediate var)
     blueprint_variable<field_type> secret_hash;
     secret_hash.allocate(bp);
 
+    // Preimage (auxilary input)
     block_variable<field_type> secret(bp, PREIMAGE_SIZE);
 
     bp.set_input_sizes(4);
 
+    // Generating constraints for bool mask
     for (auto field_var: bool_mask) {
         generate_boolean_r1cs_constraint<field_type>(bp, field_var);
     }
 
+    // Constraints for checking that the secret_hash is in hash list
     bp.add_r1cs_constraint(r1cs_constraint<field_type>(1, blueprint_sum<field_type>(bool_mask), 1));
 
     for (int i = 0; i < HASHING_LIST_SIZE; i++) {
         bp.add_r1cs_constraint(r1cs_constraint<field_type>(bool_mask[i], hash_list[i] - secret_hash, 0));
     }
 
+    // Knapsack component constraint
     knapsack_crh_with_field_out_component<field_type> 
                 f(bp, PREIMAGE_SIZE, secret, blueprint_variable_vector<field_type>(1, secret_hash));
     f.generate_r1cs_constraints();
 
-    // Generate keys
+    // Keys generation
     if (vm.count("keys")) {
         boost::filesystem::path pkout = "./pk", vkout = "./vk";
         const snark::r1cs_constraint_system<field_type> constraint_system = bp.get_constraint_system();
@@ -161,7 +191,7 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
-    // Proof generator
+    // Proof generation
     if (vm.count("proof")) {
         multiprecision::uint256_t preimage;
 
@@ -181,7 +211,7 @@ int main(int argc, char *argv[]) {
             bp.val(hash_list[i]) = hashes[i];
         }
         
-        // Filling auxilary input
+        // Filling auxilary input and intermediate variables
         secret.generate_r1cs_witness(preimage_bv);
         f.generate_r1cs_witness();
         bp.val(secret_hash) = secret_hash_w;
@@ -196,6 +226,7 @@ int main(int argc, char *argv[]) {
 
         assert(bp.is_satisfied());
 
+        // Deserializing pkey
         boost::filesystem::path pkin = "./pk";
         scheme_type::proving_key_type pkey = get_pkey(pkin);
 
@@ -204,6 +235,7 @@ int main(int argc, char *argv[]) {
         std::cout << "Start generating the proof" << std::endl;
         const typename scheme_type::proof_type proof = snark::prove<scheme_type>(pkey, bp.primary_input(), bp.auxiliary_input());
 
+        // Serializing proof
         boost::filesystem::path proof_path = "./proof";
         std::vector<std::uint8_t> proof_byteblob =
             serializer_tvm::process(proof);
@@ -229,6 +261,8 @@ int main(int argc, char *argv[]) {
         for (int i = 0; i < HASHING_LIST_SIZE; i++) {
             bp.val(hash_list[i]) = hashes[i];
         }
+
+        // Deserializing vkey
         boost::filesystem::path vkin = "./vk";
         scheme_type::verification_key_type vkey = get_vkey(vkin);
         std::cout << "Verification key was read from \"./vkey\" file" << std::endl;
@@ -362,7 +396,7 @@ scheme_type::proving_key_type get_pkey(boost::filesystem::path pkin) {
     return proving_key;
 }
 
-scheme_type::verification_key_type get_vkey( boost::filesystem::path vkin) {
+scheme_type::verification_key_type get_vkey(boost::filesystem::path vkin) {
     std::vector<uint8_t> verification_key_byteblob = read_vector_from_disk(vkin);
 
     nil::marshalling::status_type vk_deserialize_status;
@@ -378,4 +412,33 @@ scheme_type::verification_key_type get_vkey( boost::filesystem::path vkin) {
     }
 
     return verification_key;
+}
+
+// ----------------------------------------------------------------------------------
+// -----------------------------UTILS-TESTS------------------------------------------
+
+TEST(serializing_deserializing, number_to_bit_vector) {
+    multiprecision::uint256_t number = 1000;
+    std::vector<bool> v = 
+       {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0};
+
+    EXPECT_TRUE(v.size() == 256);
+    EXPECT_TRUE(v == number_to_binary(number));
+}
+
+TEST(serializing_deserializing, hash_correctness) {
+    EXPECT_TRUE(knapsack_hash(number_to_binary(1000)) == "F4C3926909F99D774211E633EC76CBA1EF65C0B4D7A4D68083EBDCAE5343E918");
+}
+
+TEST(serializing_deserializing, string_fieldVariable) {
+    std::string hash_hex = knapsack_hash(number_to_binary(1000));
+    field_type::value_type hash_field = hex_to_field_element(hash_hex);
+    EXPECT_TRUE(field_element_to_hex(hash_field) == hash_hex);
 }

@@ -11,7 +11,7 @@ cmake ..
 make cli
 ```
 
-Usage example
+## Usage example:
 
 ```shell
 cd ./bin/cli
@@ -19,4 +19,9 @@ cd ./bin/cli
 ./cli --keys
 ./cli --proof
 ./cli --verify
+```
+
+Run tests:
+```shell
+./cli --test
 ```
