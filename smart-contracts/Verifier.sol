@@ -15,11 +15,8 @@ contract PrimaryInputVerificationExample {
     }
 
     // You should change/add/remove arguments according to your circuit.
-    function verify(bytes proof,
-                    uint256[] hash_list) public returns (bool) {
+    function verify(bytes proof) public returns (bool) {
         require(proof.length == PROOF_SIZE);
-        require(hash_list.length == HASHING_LIST_SIZE);
-
         tvm.accept();
 
         string blob_str = proof;
