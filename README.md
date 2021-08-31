@@ -26,4 +26,4 @@ Run tests:
 ./cli --test
 ```
 
-Generated keys are in keys directory
+Generated keys are in smart-contracts/keys directory
