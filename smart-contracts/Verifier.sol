@@ -6,6 +6,14 @@ contract PrimaryInputVerificationExample {
     uint32 constant HASHING_LIST_SIZE = 4; //change that
     uint8 constant field_element_bytes = 32;
 
+    uint[] hash_list = new uint[](HASHING_LIST_SIZE);
+
+    constructor(uint256[] l) public {
+        for (uint i = 0; i < HASHING_LIST_SIZE; i++) {
+            hash_list[i] = l[i];
+        }
+    }
+
     // You should change/add/remove arguments according to your circuit.
     function verify(bytes proof,
                     uint256[] hash_list) public returns (bool) {
